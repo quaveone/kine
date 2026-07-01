@@ -753,6 +753,70 @@ func TestMongoDB_CompactionMetricsTrackGapAndDeletes(t *testing.T) {
 	}
 }
 
+func TestMongoDB_CompactionFailureIncrementsErrorMetric(t *testing.T) {
+	ctx, _, b := setupBackendWithConfig(t, drivers.Config{
+		CompactBatchSize: 100,
+		CompactMinRetain: 0,
+	})
+
+	rev, err := b.Create(ctx, "/test/compact-error", []byte("v0"), 0)
+	noErr(t, err)
+
+	before := testutil.ToFloat64(metrics.CompactTotal.WithLabelValues(metrics.ResultError))
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, err = b.Compact(canceledCtx, rev)
+	if err == nil {
+		t.Fatal("expected compaction with a canceled context to fail")
+	}
+	if got := testutil.ToFloat64(metrics.CompactTotal.WithLabelValues(metrics.ResultError)); got <= before {
+		t.Fatalf("expected compaction error metric to increase, before=%f after=%f", before, got)
+	}
+}
+
+func TestMongoDB_CompactionLeavesNewerWritesAndReportsGap(t *testing.T) {
+	ctx, _, b := setupBackendWithConfig(t, drivers.Config{
+		CompactBatchSize: 100,
+		CompactMinRetain: 0,
+	})
+	mb := mustMongoBackend(t, b)
+
+	key := "/test/compact-with-newer-writes"
+	rev, err := b.Create(ctx, key, []byte("v0"), 0)
+	noErr(t, err)
+	for i := range 250 {
+		rev, _, _, err = b.Update(ctx, key, []byte(fmt.Sprintf("before-%d", i)), rev, 0)
+		noErr(t, err)
+	}
+	compactTarget := rev
+
+	compactErr := make(chan error, 1)
+	go func() {
+		_, err := b.Compact(ctx, compactTarget)
+		compactErr <- err
+	}()
+
+	for i := range 25 {
+		rev, _, _, err = b.Update(ctx, key, []byte(fmt.Sprintf("after-%d", i)), rev, 0)
+		noErr(t, err)
+	}
+	noErr(t, <-compactErr)
+
+	currentRev, err := b.CurrentRevision(ctx)
+	noErr(t, err)
+	expEqual(t, rev, currentRev)
+	compactRev, err := mb.getCompactRevision(ctx)
+	noErr(t, err)
+	expEqual(t, compactTarget, compactRev)
+	expEqual(t, int64(25), currentRev-compactRev)
+	expEqual(t, float64(25), testutil.ToFloat64(metrics.MongoDBCompactionGap))
+
+	_, kv, err := b.Get(ctx, key, "", 0, 0, false)
+	noErr(t, err)
+	expEqual(t, "after-24", string(kv.Value))
+}
+
 func TestMongoDB_MultipleBackendsConcurrentCreateSameKey(t *testing.T) {
 	ctx, _, b1 := setupBackend(t)
 	mb1 := mustMongoBackend(t, b1)
