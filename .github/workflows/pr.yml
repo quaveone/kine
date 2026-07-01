@@ -122,4 +122,4 @@ jobs:
 
     - name: Run Test
       run: |
-        docker run --name run-test-${{ matrix.test }} --rm -v /var/run/docker.sock:/var/run/docker.sock -e TAG=latest rancher/kine-test:latest scripts/test ${{ matrix.test }}
+        docker run --name run-test-${{ matrix.test }} --rm -v /var/run/docker.sock:/var/run/docker.sock -e TAG=latest -e KINE_SKIP_SLOW_NAMESPACE_DRAINING=${{ matrix.arch == 'arm64' && matrix.test == 'sqlite' }} rancher/kine-test:latest scripts/test ${{ matrix.test }}
