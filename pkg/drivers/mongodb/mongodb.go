@@ -221,10 +221,10 @@ func (b *MongoBackend) validateTransactionSupport(ctx context.Context) error {
 		return fmt.Errorf("checking MongoDB transaction support: %w", err)
 	}
 	if hello.LogicalSessionTimeoutMinutes == nil {
-		return fmt.Errorf("MongoDB backend requires logical sessions for transactions")
+		return errors.New("MongoDB backend requires logical sessions for transactions")
 	}
 	if hello.SetName == "" && hello.Msg != "isdbgrid" {
-		return fmt.Errorf("MongoDB backend requires a replica set or sharded cluster because Kine revisions and events must commit transactionally")
+		return errors.New("MongoDB backend requires a replica set or sharded cluster because Kine revisions and events must commit transactionally")
 	}
 	return nil
 }
@@ -270,7 +270,7 @@ func (b *MongoBackend) ensureRevisionDocument(ctx context.Context) error {
 
 func (b *MongoBackend) startCompactor(ctx context.Context) error {
 	if b.compactIntervalJitter < 0 || b.compactIntervalJitter > 100 {
-		return fmt.Errorf("compact-interval-jitter must be between 0 and 100")
+		return errors.New("compact-interval-jitter must be between 0 and 100")
 	}
 	if b.compactInterval <= 0 {
 		logrus.Debugf("COMPACT disabled; automatic MongoDB compaction will not occur")
@@ -403,13 +403,14 @@ func (b *MongoBackend) observeCollectionMetrics(ctx context.Context) {
 // It returns nil KV when the key does not exist or its latest event is a deletion.
 // If revision is 0, the latest is returned. rangeEnd and limit are unused for single-key gets.
 func (b *MongoBackend) Get(ctx context.Context, key, rangeEnd string, limit, revision int64, keysOnly bool) (int64, *server.KeyValue, error) {
-	// Return ErrCompacted for any historical read at or below the compact point.
+	// Return ErrCompacted for historical reads before the compact point. Reads at
+	// the compact revision itself remain valid, matching etcd storage semantics.
 	if revision > 0 {
 		compactRev, err := b.getCompactRevision(ctx)
 		if err != nil {
 			return 0, nil, err
 		}
-		if revision <= compactRev {
+		if revision < compactRev {
 			return revision, nil, server.ErrCompacted
 		}
 	}
@@ -492,7 +493,11 @@ func (b *MongoBackend) Create(ctx context.Context, key string, value []byte, lea
 	}
 	b.notifyWatchers()
 	b.observeRevisionMetrics(ctx)
-	return result.(int64), nil
+	rev, ok := result.(int64)
+	if !ok {
+		return 0, fmt.Errorf("unexpected MongoDB create transaction result type %T", result)
+	}
+	return rev, nil
 }
 
 // Update modifies the value of key at the exact given revision.
@@ -547,7 +552,10 @@ func (b *MongoBackend) Update(ctx context.Context, key string, value []byte, rev
 		}
 		return 0, nil, false, err
 	}
-	out := result.(updateResult)
+	out, ok := result.(updateResult)
+	if !ok {
+		return 0, nil, false, fmt.Errorf("unexpected MongoDB update transaction result type %T", result)
+	}
 	if out.ok {
 		b.notifyWatchers()
 		b.observeRevisionMetrics(ctx)
@@ -603,7 +611,10 @@ func (b *MongoBackend) Delete(ctx context.Context, key string, revision int64) (
 		}
 		return 0, nil, false, err
 	}
-	out := result.(updateResult)
+	out, ok := result.(updateResult)
+	if !ok {
+		return 0, nil, false, fmt.Errorf("unexpected MongoDB delete transaction result type %T", result)
+	}
 	if out.ok && out.kv != nil {
 		b.notifyWatchers()
 		b.observeRevisionMetrics(ctx)
@@ -629,7 +640,7 @@ func (b *MongoBackend) List(ctx context.Context, prefix, startKey string, limit,
 		if err != nil {
 			return 0, nil, err
 		}
-		if revision <= compactRev {
+		if revision < compactRev {
 			return revision, nil, server.ErrCompacted
 		}
 	}
@@ -692,7 +703,7 @@ func (b *MongoBackend) Count(ctx context.Context, prefix, startKey string, revis
 		if err != nil {
 			return 0, 0, err
 		}
-		if revision <= compactRev {
+		if revision < compactRev {
 			return revision, 0, server.ErrCompacted
 		}
 	}
@@ -971,12 +982,18 @@ func (b *MongoBackend) compactBatch(ctx context.Context, compactRev, targetCompa
 	metrics.MongoDBCompactionBatchSeconds.Observe(time.Since(start).Seconds())
 	if err != nil {
 		if result != nil && errors.Is(err, server.ErrCompacted) {
-			out := result.(compactBatchResult)
+			out, ok := result.(compactBatchResult)
+			if !ok {
+				return 0, 0, fmt.Errorf("unexpected MongoDB compact transaction result type %T", result)
+			}
 			return out.compacted, out.current, err
 		}
 		return 0, 0, err
 	}
-	out := result.(compactBatchResult)
+	out, ok := result.(compactBatchResult)
+	if !ok {
+		return 0, 0, fmt.Errorf("unexpected MongoDB compact transaction result type %T", result)
+	}
 	if out.deleted > 0 {
 		metrics.MongoDBCompactionDeletedDocumentsTotal.Add(float64(out.deleted))
 	}

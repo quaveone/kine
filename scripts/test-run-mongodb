@@ -1,40 +1,67 @@
 #!/bin/bash
 
-# database-pre-hook is called by provision-database after creating the metadata directory.
-# Used here to inject the MongoDB root username into the container env-file, since
-# provision-database only sets the password via DB_PASSWORD_ENV.
-database-pre-hook() {
-    local count=$1
-    echo "MONGO_INITDB_ROOT_USERNAME=mongo" >> $TEST_DIR/databases/$count/metadata/env
+# The MongoDB backend requires transactions, so even the official single-node
+# test path must run MongoDB as a replica set. This keeps scripts/test mongodb
+# aligned with production semantics instead of silently testing standalone MongoDB.
+mongo_ping_test() {
+    docker run --rm \
+        --name connection-test \
+        mongo:7.0 \
+        mongosh "$MONGO_TEST_URI_DIRECT" --eval 'db.adminCommand({ping:1})'
 }
-export -f database-pre-hook
+export -f mongo_ping_test
+
+mongo_primary_test() {
+    docker run --rm \
+        --name connection-test \
+        mongo:7.0 \
+        mongosh "$MONGO_TEST_URI_REPLICA_SET" --eval 'if (rs.status().myState !== 1) { quit(1) }'
+}
+export -f mongo_primary_test
+
+database-post-hook() {
+    local count=$1
+    local ip=$(cat $TEST_DIR/databases/$count/metadata/ip)
+    local port=$(cat $TEST_DIR/databases/$count/metadata/port)
+    export MONGO_TEST_URI_DIRECT="mongodb://$ip:$port/admin?directConnection=true"
+    export MONGO_TEST_URI_REPLICA_SET="mongodb://$ip:$port/admin?replicaSet=rs0"
+
+    DB_CONNECTION_TEST=mongo_ping_test \
+    timeout --foreground 2m bash -c "wait-for-db-connection"
+
+    docker run --rm \
+        --name mongo-rs-init \
+        mongo:7.0 \
+        mongosh "mongodb://$ip:$port/admin?directConnection=true" \
+        --eval "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'$ip:$port'}]}).ok }"
+
+    DB_CONNECTION_TEST=mongo_primary_test \
+    timeout --foreground 2m bash -c "wait-for-db-connection"
+}
+export -f database-post-hook
 
 start-test() {
     local ip=$(cat $TEST_DIR/databases/*/metadata/ip)
     local port=$(cat $TEST_DIR/databases/*/metadata/port)
-    local pass=$(cat $TEST_DIR/databases/*/metadata/password)
+    local endpoint="mongodb://$ip:$port/kine?replicaSet=rs0"
 
-    # Wait until MongoDB is ready to accept connections.
-    DB_CONNECTION_TEST="
-        docker run --rm
-        --name connection-test
-        mongo:7.0
-        mongosh mongodb://mongo:$pass@$ip:$port/admin --eval 'db.adminCommand({ping:1})'" \
-    timeout --foreground 2m bash -c "wait-for-db-connection"
-
-    KINE_IMAGE=$IMAGE KINE_ENDPOINT="mongodb://mongo:$pass@$ip:$port/kine?authSource=admin" run-apiserver-tests
-    KINE_IMAGE=$IMAGE KINE_ENDPOINT="mongodb://mongo:$pass@$ip:$port/kine?authSource=admin" provision-kine
+    KINE_IMAGE=$IMAGE KINE_ENDPOINT="$endpoint" run-apiserver-tests
+    KINE_IMAGE=$IMAGE KINE_ENDPOINT="$endpoint" provision-kine
     local kine_url=$(cat $TEST_DIR/kine/*/metadata/url)
     K3S_DATASTORE_ENDPOINT=$kine_url provision-cluster
 }
 export -f start-test
 
 VERSION_LIST="\
-    mongo 8.0"
+    mongo 7.0"
 
 while read ENGINE VERSION; do
+    # Use an inert password env var. Enabling MongoDB authorization on a replica
+    # set also requires a keyFile, which is outside this single-node integration
+    # test. Auth/TLS should be covered by deployment-specific smoke tests.
     LABEL=$ENGINE-$VERSION \
-        DB_PASSWORD_ENV=MONGO_INITDB_ROOT_PASSWORD \
+        DB_PASSWORD_ENV=KINE_MONGODB_TEST_PASSWORD \
         DB_IMAGE=docker.io/library/$ENGINE:$VERSION \
+        DB_ARGS="--replSet rs0 --bind_ip_all" \
         run-test
 done <<< $VERSION_LIST

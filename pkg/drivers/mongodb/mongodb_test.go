@@ -14,6 +14,9 @@ import (
 	"github.com/k3s-io/kine/pkg/drivers"
 	kserver "github.com/k3s-io/kine/pkg/server"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
 // nonAlphanumRe strips characters not allowed in MongoDB database names.
@@ -42,6 +45,12 @@ func setupBackendWithConfig(t *testing.T, cfg drivers.Config) (context.Context, 
 	if baseURI == "" {
 		t.Skip("skipping: MONGODB_TEST_URL not set — start a MongoDB instance and set the variable")
 	}
+
+	return setupBackendFromURI(t, baseURI, cfg)
+}
+
+func setupBackendFromURI(t *testing.T, baseURI string, cfg drivers.Config) (context.Context, *sync.WaitGroup, kserver.Backend) {
+	t.Helper()
 
 	// Build a unique database name from the test name so tests are fully isolated.
 	dbName := "kinetest_" + strings.ToLower(nonAlphanumRe.ReplaceAllString(t.Name(), "_"))
@@ -120,6 +129,15 @@ func expEqualKeys(t *testing.T, want []string, got []*kserver.KeyValue) {
 	for i, k := range want {
 		expEqual(t, k, got[i].Key)
 	}
+}
+
+func mustMongoBackend(t *testing.T, backend kserver.Backend) *MongoBackend {
+	t.Helper()
+	mb, ok := backend.(*MongoBackend)
+	if !ok {
+		t.Fatalf("expected *MongoBackend, got %T", backend)
+	}
+	return mb
 }
 
 // --- tests ---
@@ -480,7 +498,7 @@ func TestMongoDB_Compact(t *testing.T) {
 	ctx, _, b := setupBackendWithConfig(t, drivers.Config{
 		CompactMinRetain: 0,
 	})
-	mb := b.(*MongoBackend)
+	mb := mustMongoBackend(t, b)
 
 	pfx := func(k string) string { return "/test" + k }
 
@@ -526,6 +544,21 @@ func TestMongoDB_Compact(t *testing.T) {
 	}
 	expEqual(t, "v3", string(kv.Value))
 
+	// Reads at the compact revision itself must remain valid; only older
+	// revisions are compacted. Kubernetes apiserver list paging depends on this
+	// etcd-compatible boundary.
+	_, kv, err = b.Get(ctx, pfx("/compact"), "", 0, delRev, false)
+	noErr(t, err)
+	expEqual(t, "v3", string(kv.Value))
+
+	_, list, err := b.List(ctx, pfx("/"), "", 0, delRev, false)
+	noErr(t, err)
+	expEqual(t, 1, len(list))
+
+	_, count, err := b.Count(ctx, pfx("/"), "", delRev)
+	noErr(t, err)
+	expEqual(t, int64(1), count)
+
 	// Deleted key must remain absent.
 	_, kv, err = b.Get(ctx, pfx("/todelete"), "", 0, 0, false)
 	noErr(t, err)
@@ -542,7 +575,7 @@ func TestMongoDB_CompactLargeBacklogAdvancesInBatches(t *testing.T) {
 		CompactBatchSize: 100,
 		CompactMinRetain: 0,
 	})
-	mb := b.(*MongoBackend)
+	mb := mustMongoBackend(t, b)
 
 	key := "/test/backlog"
 	rev, err := b.Create(ctx, key, []byte("v0"), 0)
@@ -575,7 +608,7 @@ func TestMongoDB_CompactLargeBacklogAdvancesInBatches(t *testing.T) {
 
 func TestMongoDB_MultipleBackendsConcurrentCreateSameKey(t *testing.T) {
 	ctx, _, b1 := setupBackend(t)
-	mb1 := b1.(*MongoBackend)
+	mb1 := mustMongoBackend(t, b1)
 
 	wg := &sync.WaitGroup{}
 	_, b2Raw, err := New(ctx, wg, &drivers.Config{
@@ -583,7 +616,7 @@ func TestMongoDB_MultipleBackendsConcurrentCreateSameKey(t *testing.T) {
 	})
 	noErr(t, err)
 	noErr(t, b2Raw.Start(ctx))
-	b2 := b2Raw.(*MongoBackend)
+	b2 := mustMongoBackend(t, b2Raw)
 
 	key := "/test/concurrent-create"
 	errs := make(chan error, 2)
@@ -628,7 +661,7 @@ func TestMongoDB_MultipleBackendsConcurrentCreateSameKey(t *testing.T) {
 
 func TestMongoDB_MultipleBackendsConcurrentUpdateSameRevisionNoGap(t *testing.T) {
 	ctx, _, b1 := setupBackend(t)
-	mb1 := b1.(*MongoBackend)
+	mb1 := mustMongoBackend(t, b1)
 
 	wg := &sync.WaitGroup{}
 	_, b2Raw, err := New(ctx, wg, &drivers.Config{
@@ -636,7 +669,7 @@ func TestMongoDB_MultipleBackendsConcurrentUpdateSameRevisionNoGap(t *testing.T)
 	})
 	noErr(t, err)
 	noErr(t, b2Raw.Start(ctx))
-	b2 := b2Raw.(*MongoBackend)
+	b2 := mustMongoBackend(t, b2Raw)
 
 	key := "/test/concurrent-update"
 	createRev, err := b1.Create(ctx, key, []byte("v1"), 0)
@@ -686,6 +719,99 @@ func TestMongoDB_MultipleBackendsConcurrentUpdateSameRevisionNoGap(t *testing.T)
 	docs, err := mb1.coll.CountDocuments(ctx, bson.M{"key": key})
 	noErr(t, err)
 	expEqual(t, int64(2), docs)
+}
+
+func TestMongoDB_ThreeMemberReplicaSetFailoverKeepsCompactionHealthy(t *testing.T) {
+	baseURI := os.Getenv("MONGODB_THREE_MEMBER_TEST_URL")
+	if baseURI == "" {
+		t.Skip("skipping: MONGODB_THREE_MEMBER_TEST_URL not set")
+	}
+
+	ctx, _, b := setupBackendFromURI(t, baseURI, drivers.Config{
+		CompactBatchSize: 100,
+		CompactMinRetain: 0,
+	})
+	mb := mustMongoBackend(t, b)
+
+	key := "/test/three-member-failover"
+	rev, err := b.Create(ctx, key, []byte("v0"), 0)
+	noErr(t, err)
+	for i := range 250 {
+		rev, _, _, err = b.Update(ctx, key, []byte(fmt.Sprintf("before-%d", i)), rev, 0)
+		noErr(t, err)
+	}
+
+	_, err = b.Compact(ctx, rev)
+	noErr(t, err)
+	assertCompactionHealthy(ctx, t, mb, key, rev)
+
+	stepDownPrimary(t, baseURI)
+	waitForWritablePrimary(t, baseURI)
+
+	for i := range 50 {
+		rev, _, _, err = b.Update(ctx, key, []byte(fmt.Sprintf("after-%d", i)), rev, 0)
+		noErr(t, err)
+	}
+	_, err = b.Compact(ctx, rev)
+	noErr(t, err)
+	assertCompactionHealthy(ctx, t, mb, key, rev)
+
+	_, kv, err := b.Get(ctx, key, "", 0, 0, false)
+	noErr(t, err)
+	expEqual(t, "after-49", string(kv.Value))
+}
+
+func stepDownPrimary(t *testing.T, uri string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	noErr(t, err)
+	defer client.Disconnect(context.Background())
+
+	err = client.Database("admin").RunCommand(ctx, bson.D{
+		{Key: "replSetStepDown", Value: int32(5)},
+		{Key: "force", Value: true},
+	}).Err()
+	if err != nil {
+		t.Logf("replSetStepDown returned expected transient error while primary steps down: %v", err)
+	}
+}
+
+func waitForWritablePrimary(t *testing.T, uri string) {
+	t.Helper()
+
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		client, err := mongo.Connect(options.Client().ApplyURI(uri))
+		if err == nil {
+			err = client.Ping(ctx, readpref.Primary())
+		}
+		_ = client.Disconnect(context.Background())
+		cancel()
+		if err == nil {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatal("timed out waiting for MongoDB replica set to elect a writable primary")
+}
+
+func assertCompactionHealthy(ctx context.Context, t *testing.T, mb *MongoBackend, key string, wantCompactRev int64) {
+	t.Helper()
+
+	currentRev, err := mb.CurrentRevision(ctx)
+	noErr(t, err)
+	compactRev, err := mb.getCompactRevision(ctx)
+	noErr(t, err)
+	expEqual(t, wantCompactRev, compactRev)
+	expEqual(t, int64(0), currentRev-compactRev)
+
+	docs, err := mb.coll.CountDocuments(ctx, bson.M{"key": key})
+	noErr(t, err)
+	expEqual(t, int64(1), docs)
 }
 
 func TestMongoDB_DbSize(t *testing.T) {

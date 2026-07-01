@@ -1,0 +1,67 @@
+#!/bin/bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+MONGO_IMAGE=${MONGO_IMAGE:-mongo:7.0}
+GO_IMAGE=${GO_IMAGE:-golang:1.25}
+NETWORK=${NETWORK:-kine-mongodb-rs-$$}
+PREFIX=${PREFIX:-kine-mongodb-rs-$$}
+
+cleanup() {
+    set +e
+    for i in 1 2 3; do
+        docker rm -f "$PREFIX-$i" >/dev/null 2>&1
+    done
+    docker network rm "$NETWORK" >/dev/null 2>&1
+}
+trap cleanup EXIT INT TERM
+
+cleanup
+docker network create "$NETWORK" >/dev/null
+
+for i in 1 2 3; do
+    docker run -d \
+        --name "$PREFIX-$i" \
+        --hostname "mongo$i" \
+        --network "$NETWORK" \
+        --network-alias "mongo$i" \
+        "$MONGO_IMAGE" \
+        --replSet rs0 --bind_ip_all >/dev/null
+done
+
+for i in 1 2 3; do
+    until docker exec "$PREFIX-$i" mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' >/dev/null 2>&1; do
+        echo "Waiting for mongo$i to accept connections..."
+        sleep 2
+    done
+done
+
+docker exec "$PREFIX-1" mongosh --quiet --eval '
+rs.initiate({
+  _id: "rs0",
+  members: [
+    {_id: 0, host: "mongo1:27017"},
+    {_id: 1, host: "mongo2:27017"},
+    {_id: 2, host: "mongo3:27017"}
+  ]
+})
+' >/dev/null
+
+until docker exec "$PREFIX-1" mongosh --quiet --eval 'rs.status().members.filter(m => m.state === 1).length === 1 && rs.status().members.filter(m => m.state === 2).length === 2' | grep -q true; do
+    echo "Waiting for three-member replica set primary + secondaries..."
+    sleep 2
+done
+
+MONGODB_URL='mongodb://mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0'
+
+docker run --rm \
+    --network "$NETWORK" \
+    -v "$PWD:/src" \
+    -w /src \
+    -e GOMODCACHE=/tmp/gomodcache \
+    -e GOCACHE=/tmp/gocache \
+    -e MONGODB_TEST_URL="$MONGODB_URL" \
+    -e MONGODB_THREE_MEMBER_TEST_URL="$MONGODB_URL" \
+    "$GO_IMAGE" \
+    bash -c 'set -o pipefail; go test ./pkg/drivers/mongodb -count=1 -v | tee /tmp/mongodb-test.log; ! grep -q -- "--- SKIP:" /tmp/mongodb-test.log'

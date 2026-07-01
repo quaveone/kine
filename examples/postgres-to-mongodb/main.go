@@ -43,7 +43,7 @@ func main() {
 		os.Exit(2)
 	}
 	if *batchSize <= 0 {
-		log.Fatalf("batch must be positive")
+		log.Fatal("batch must be positive")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -80,7 +80,7 @@ func run(ctx context.Context, cfg migrateConfig) error {
 		return err
 	}
 	if summary.totalRows == 0 {
-		return fmt.Errorf("source kine table is empty")
+		return errors.New("source kine table is empty")
 	}
 
 	mongoClient, err := mongo.Connect(options.Client().ApplyURI(cfg.mongoURL))
@@ -104,13 +104,13 @@ func run(ctx context.Context, cfg migrateConfig) error {
 		return err
 	}
 
-	fmt.Printf("source rows: %d\n", summary.totalRows)
-	fmt.Printf("source non-compact rows: %d\n", summary.migratableRows)
-	fmt.Printf("source max revision: %d\n", summary.maxRevision)
-	fmt.Printf("source compact revision: %d\n", summary.compactRevision)
-	fmt.Printf("target MongoDB database: %s\n", dbName)
+	outputf("source rows: %d\n", summary.totalRows)
+	outputf("source non-compact rows: %d\n", summary.migratableRows)
+	outputf("source max revision: %d\n", summary.maxRevision)
+	outputf("source compact revision: %d\n", summary.compactRevision)
+	outputf("target MongoDB database: %s\n", dbName)
 	if cfg.dryRun {
-		fmt.Println("dry run complete; no MongoDB writes performed")
+		outputln("dry run complete; no MongoDB writes performed")
 		return nil
 	}
 
@@ -126,9 +126,17 @@ func run(ctx context.Context, cfg migrateConfig) error {
 		return err
 	}
 
-	fmt.Printf("migration complete: inserted %d MongoDB Kine documents\n", inserted)
-	fmt.Printf("revision document: revision=%d compactRevision=%d\n", summary.maxRevision, summary.compactRevision)
+	outputf("migration complete: inserted %d MongoDB Kine documents\n", inserted)
+	outputf("revision document: revision=%d compactRevision=%d\n", summary.maxRevision, summary.compactRevision)
 	return nil
+}
+
+func outputf(format string, args ...any) {
+	_, _ = fmt.Printf(format, args...)
+}
+
+func outputln(args ...any) {
+	_, _ = fmt.Println(args...)
 }
 
 type postgresSummary struct {
@@ -162,7 +170,7 @@ func validateMongoTarget(ctx context.Context, db *mongo.Database, kineColl, revC
 		return fmt.Errorf("checking MongoDB target: %w", err)
 	}
 	if hello.LogicalSessionTimeoutMinutes == nil || (hello.SetName == "" && hello.Msg != "isdbgrid") {
-		return fmt.Errorf("target MongoDB must be a replica set or sharded cluster with logical sessions")
+		return errors.New("target MongoDB must be a replica set or sharded cluster with logical sessions")
 	}
 
 	if dropTarget {
@@ -224,7 +232,7 @@ func copyRows(ctx context.Context, conn *pgx.Conn, coll *mongo.Collection, batch
 			return err
 		}
 		inserted += int64(len(batch))
-		fmt.Printf("\r  %d rows migrated", inserted)
+		outputf("\r  %d rows migrated", inserted)
 		batch = batch[:0]
 		return nil
 	}
@@ -248,7 +256,7 @@ func copyRows(ctx context.Context, conn *pgx.Conn, coll *mongo.Collection, batch
 	if err := flush(); err != nil {
 		return inserted, fmt.Errorf("inserting final MongoDB batch: %w", err)
 	}
-	fmt.Println()
+	outputln()
 	return inserted, nil
 }
 
