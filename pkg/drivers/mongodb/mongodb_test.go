@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/k3s-io/kine/pkg/drivers"
+	"github.com/k3s-io/kine/pkg/metrics"
 	kserver "github.com/k3s-io/kine/pkg/server"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -141,6 +143,32 @@ func mustMongoBackend(t *testing.T, backend kserver.Backend) *MongoBackend {
 }
 
 // --- tests ---
+
+func TestMongoDB_StandaloneServerRejected(t *testing.T) {
+	baseURI := os.Getenv("MONGODB_STANDALONE_TEST_URL")
+	if baseURI == "" {
+		t.Skip("skipping: MONGODB_STANDALONE_TEST_URL not set")
+	}
+
+	dbName := "kinetest_" + strings.ToLower(nonAlphanumRe.ReplaceAllString(t.Name(), "_"))
+	ctx := context.Background()
+	wg := &sync.WaitGroup{}
+	_, backend, err := New(ctx, wg, &drivers.Config{
+		DataSourceName: databaseURI(baseURI, dbName),
+	})
+	noErr(t, err)
+	mb := mustMongoBackend(t, backend)
+	defer mb.client.Disconnect(context.Background())
+	defer mb.db.Drop(context.Background())
+
+	err = backend.Start(ctx)
+	if err == nil {
+		t.Fatal("expected standalone MongoDB to be rejected because transactions require a replica set or sharded cluster")
+	}
+	if !strings.Contains(err.Error(), "requires a replica set or sharded cluster") {
+		t.Fatalf("expected replica-set requirement error, got: %v", err)
+	}
+}
 
 func TestMongoDB_Create(t *testing.T) {
 	ctx, _, b := setupBackend(t)
@@ -604,6 +632,125 @@ func TestMongoDB_CompactLargeBacklogAdvancesInBatches(t *testing.T) {
 	_, kv, err := b.Get(ctx, key, "", 0, 0, false)
 	noErr(t, err)
 	expEqual(t, "v350", string(kv.Value))
+}
+
+func TestMongoDB_CompactHonorsMinRetain(t *testing.T) {
+	const minRetain = int64(3)
+
+	ctx, _, b := setupBackendWithConfig(t, drivers.Config{
+		CompactBatchSize: 100,
+		CompactMinRetain: minRetain,
+	})
+	mb := mustMongoBackend(t, b)
+
+	key := "/test/min-retain"
+	rev, err := b.Create(ctx, key, []byte("v0"), 0)
+	noErr(t, err)
+	for i := range 10 {
+		rev, _, _, err = b.Update(ctx, key, []byte(fmt.Sprintf("v%d", i+1)), rev, 0)
+		noErr(t, err)
+	}
+
+	current, err := b.Compact(ctx, rev)
+	noErr(t, err)
+	expEqual(t, rev, current)
+
+	compactRev, err := mb.getCompactRevision(ctx)
+	noErr(t, err)
+	expEqual(t, rev-minRetain, compactRev)
+
+	docs, err := mb.coll.CountDocuments(ctx, bson.M{"key": key})
+	noErr(t, err)
+	expEqual(t, minRetain+1, docs)
+
+	_, kv, err := b.Get(ctx, key, "", 0, compactRev, false)
+	noErr(t, err)
+	expEqual(t, fmt.Sprintf("v%d", 10-int(minRetain)), string(kv.Value))
+
+	_, _, err = b.Get(ctx, key, "", 0, compactRev-1, false)
+	expEqualErr(t, kserver.ErrCompacted, err)
+}
+
+func TestMongoDB_ConcurrentCompactionAdvancesOnce(t *testing.T) {
+	ctx, _, b := setupBackendWithConfig(t, drivers.Config{
+		CompactBatchSize: 100,
+		CompactMinRetain: 0,
+	})
+	mb := mustMongoBackend(t, b)
+
+	key := "/test/concurrent-compact"
+	rev, err := b.Create(ctx, key, []byte("v0"), 0)
+	noErr(t, err)
+	for i := range 250 {
+		rev, _, _, err = b.Update(ctx, key, []byte(fmt.Sprintf("v%d", i+1)), rev, 0)
+		noErr(t, err)
+	}
+
+	errs := make(chan error, 2)
+	var current [2]int64
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := range 2 {
+		go func(i int) {
+			defer wg.Done()
+			var err error
+			current[i], err = b.Compact(ctx, rev)
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		noErr(t, err)
+	}
+	expEqual(t, rev, current[0])
+	expEqual(t, rev, current[1])
+
+	assertCompactionHealthy(ctx, t, mb, key, rev)
+}
+
+func TestMongoDB_CompactionMetricsTrackGapAndDeletes(t *testing.T) {
+	ctx, _, b := setupBackendWithConfig(t, drivers.Config{
+		CompactBatchSize: 100,
+		CompactMinRetain: 0,
+	})
+	mb := mustMongoBackend(t, b)
+
+	deletedBefore := testutil.ToFloat64(metrics.MongoDBCompactionDeletedDocumentsTotal)
+
+	key := "/test/metrics"
+	rev, err := b.Create(ctx, key, []byte("v0"), 0)
+	noErr(t, err)
+	for i := range 5 {
+		rev, _, _, err = b.Update(ctx, key, []byte(fmt.Sprintf("v%d", i+1)), rev, 0)
+		noErr(t, err)
+	}
+
+	expEqual(t, float64(rev), testutil.ToFloat64(metrics.MongoDBCurrentRevision))
+	expEqual(t, float64(0), testutil.ToFloat64(metrics.MongoDBCompactRevision))
+	expEqual(t, float64(rev), testutil.ToFloat64(metrics.MongoDBCompactionGap))
+
+	beforeDocs, err := mb.coll.CountDocuments(ctx, bson.M{"key": key})
+	noErr(t, err)
+	expEqual(t, int64(6), beforeDocs)
+
+	current, err := b.Compact(ctx, rev)
+	noErr(t, err)
+	expEqual(t, rev, current)
+
+	expEqual(t, float64(rev), testutil.ToFloat64(metrics.MongoDBCurrentRevision))
+	expEqual(t, float64(rev), testutil.ToFloat64(metrics.MongoDBCompactRevision))
+	expEqual(t, float64(0), testutil.ToFloat64(metrics.MongoDBCompactionGap))
+
+	afterDocs, err := mb.coll.CountDocuments(ctx, bson.M{"key": key})
+	noErr(t, err)
+	expEqual(t, int64(1), afterDocs)
+	totalDocs, err := mb.coll.EstimatedDocumentCount(ctx)
+	noErr(t, err)
+	expEqual(t, float64(totalDocs), testutil.ToFloat64(metrics.MongoDBDocuments))
+	if got := testutil.ToFloat64(metrics.MongoDBCompactionDeletedDocumentsTotal); got <= deletedBefore {
+		t.Fatalf("expected compaction deleted-documents counter to increase, before=%f after=%f", deletedBefore, got)
+	}
 }
 
 func TestMongoDB_MultipleBackendsConcurrentCreateSameKey(t *testing.T) {

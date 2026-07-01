@@ -10,6 +10,7 @@ PREFIX=${PREFIX:-kine-mongodb-rs-$$}
 
 cleanup() {
     set +e
+    docker rm -f "$PREFIX-standalone" "$PREFIX-postgres" >/dev/null 2>&1
     for i in 1 2 3; do
         docker rm -f "$PREFIX-$i" >/dev/null 2>&1
     done
@@ -19,6 +20,18 @@ trap cleanup EXIT INT TERM
 
 cleanup
 docker network create "$NETWORK" >/dev/null
+
+docker run -d \
+    --name "$PREFIX-standalone" \
+    --hostname mongo-standalone \
+    --network "$NETWORK" \
+    --network-alias mongo-standalone \
+    "$MONGO_IMAGE" >/dev/null
+
+until docker exec "$PREFIX-standalone" mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' >/dev/null 2>&1; do
+    echo "Waiting for standalone MongoDB to accept connections..."
+    sleep 2
+done
 
 for i in 1 2 3; do
     docker run -d \
@@ -54,6 +67,44 @@ until docker exec "$PREFIX-1" mongosh --quiet --eval 'rs.status().members.filter
 done
 
 MONGODB_URL='mongodb://mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0'
+MONGODB_MIGRATION_URL='mongodb://mongo1:27017,mongo2:27017,mongo3:27017/kine_migration?replicaSet=rs0'
+
+docker run -d \
+    --name "$PREFIX-postgres" \
+    --hostname postgres \
+    --network "$NETWORK" \
+    --network-alias postgres \
+    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_DB=kine \
+    postgres:16 >/dev/null
+
+until docker exec "$PREFIX-postgres" pg_isready -U postgres -d kine >/dev/null 2>&1; do
+    echo "Waiting for PostgreSQL migration source to accept connections..."
+    sleep 2
+done
+
+docker exec -i "$PREFIX-postgres" psql -U postgres -d kine >/dev/null <<'SQL'
+CREATE TABLE kine
+  (
+    id BIGSERIAL PRIMARY KEY,
+    name text COLLATE "C",
+    created INTEGER,
+    deleted INTEGER,
+    create_revision BIGINT,
+    prev_revision BIGINT,
+    lease INTEGER,
+    value bytea,
+    old_value bytea
+  );
+
+INSERT INTO kine(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value) VALUES
+  (1, 'compact_rev_key', 0, 0, 0, 3, 0, NULL, NULL),
+  (2, '/registry/a', 1, 0, 2, 0, 0, decode('7631', 'hex'), NULL),
+  (3, '/registry/a', 0, 0, 2, 2, 0, decode('7632', 'hex'), decode('7631', 'hex')),
+  (4, '/registry/b', 1, 0, 4, 0, 42, decode('62', 'hex'), NULL),
+  (5, '/registry/a', 0, 1, 2, 3, 0, NULL, decode('7632', 'hex')),
+  (6, '/registry/a', 1, 0, 6, 5, 0, decode('7265626f726e', 'hex'), NULL);
+SQL
 
 docker run --rm \
     --network "$NETWORK" \
@@ -63,5 +114,45 @@ docker run --rm \
     -e GOCACHE=/tmp/gocache \
     -e MONGODB_TEST_URL="$MONGODB_URL" \
     -e MONGODB_THREE_MEMBER_TEST_URL="$MONGODB_URL" \
+    -e MONGODB_STANDALONE_TEST_URL='mongodb://mongo-standalone:27017/?directConnection=true' \
     "$GO_IMAGE" \
-    bash -c 'set -o pipefail; go test ./pkg/drivers/mongodb -count=1 -v | tee /tmp/mongodb-test.log; ! grep -q -- "--- SKIP:" /tmp/mongodb-test.log'
+    bash -c "set -euo pipefail
+      go test ./pkg/drivers/mongodb -count=1 -v | tee /tmp/mongodb-test.log
+      ! grep -q -- '--- SKIP:' /tmp/mongodb-test.log
+      go test ./examples/postgres-to-mongodb -count=1 -v
+      go run ./examples/postgres-to-mongodb \
+        -postgres 'postgres://postgres:postgres@postgres:5432/kine?sslmode=disable' \
+        -mongodb '$MONGODB_MIGRATION_URL' \
+        -batch 2"
+
+docker run --rm -i \
+    --network "$NETWORK" \
+    "$MONGO_IMAGE" \
+    mongosh "$MONGODB_MIGRATION_URL" --quiet <<'JS'
+const migration = db.getSiblingDB("kine_migration");
+const n = (value) => value && typeof value.toNumber === "function" ? value.toNumber() : Number(value);
+const docs = migration.kine.find({}, {_id: 0, revision: 1, key: 1, deleted: 1, prevRevision: 1, lease: 1}).sort({revision: 1}).toArray();
+const revisions = docs.map((doc) => n(doc.revision)).join(",");
+if (revisions !== "2,3,4,5,6") {
+  print(`unexpected migrated revisions: ${revisions}`);
+  quit(1);
+}
+
+const rev = migration.revision.findOne({_id: "global"});
+if (!rev || n(rev.revision) !== 6 || n(rev.compactRevision) !== 3) {
+  print(`unexpected revision document: ${JSON.stringify(rev)}`);
+  quit(1);
+}
+
+const latestA = migration.kine.find({key: "/registry/a"}).sort({revision: -1}).limit(1).toArray()[0];
+if (!latestA || n(latestA.revision) !== 6 || n(latestA.deleted) !== 0 || n(latestA.prevRevision) !== 5) {
+  print(`unexpected latest /registry/a document: ${JSON.stringify(latestA)}`);
+  quit(1);
+}
+
+const b = migration.kine.findOne({key: "/registry/b"});
+if (!b || n(b.lease) !== 42) {
+  print(`unexpected /registry/b document: ${JSON.stringify(b)}`);
+  quit(1);
+}
+JS

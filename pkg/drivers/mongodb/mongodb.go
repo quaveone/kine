@@ -854,6 +854,9 @@ func (b *MongoBackend) Compact(ctx context.Context, revision int64) (int64, erro
 		compacted, _, err := b.compactBatch(ctx, compactRev, target)
 		if err != nil {
 			if errors.Is(err, server.ErrCompacted) {
+				if compacted <= compactRev {
+					break
+				}
 				compactRev = compacted
 				continue
 			}
