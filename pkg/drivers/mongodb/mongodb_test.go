@@ -13,6 +13,7 @@ import (
 
 	"github.com/k3s-io/kine/pkg/drivers"
 	kserver "github.com/k3s-io/kine/pkg/server"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // nonAlphanumRe strips characters not allowed in MongoDB database names.
@@ -27,9 +28,14 @@ var nonAlphanumRe = regexp.MustCompile(`[^a-zA-Z0-9]`)
 //
 // To run the tests locally:
 //
-//	docker run -d --rm -p 27017:27017 --name kine-mongo mongo:7.0
-//	MONGODB_TEST_URL=mongodb://localhost:27017 go test ./pkg/drivers/mongodb/...
+//	docker run -d --rm -p 27017:27017 --name kine-mongo mongo:7.0 --replSet rs0 --bind_ip_all
+//	docker exec kine-mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]})'
+//	MONGODB_TEST_URL='mongodb://localhost:27017/?replicaSet=rs0' go test ./pkg/drivers/mongodb/...
 func setupBackend(t *testing.T) (context.Context, *sync.WaitGroup, kserver.Backend) {
+	return setupBackendWithConfig(t, drivers.Config{})
+}
+
+func setupBackendWithConfig(t *testing.T, cfg drivers.Config) (context.Context, *sync.WaitGroup, kserver.Backend) {
 	t.Helper()
 
 	baseURI := os.Getenv("MONGODB_TEST_URL")
@@ -42,12 +48,13 @@ func setupBackend(t *testing.T) (context.Context, *sync.WaitGroup, kserver.Backe
 	if len(dbName) > 38 {
 		dbName = dbName[:38]
 	}
-	uri := strings.TrimRight(baseURI, "/") + "/" + dbName
+	uri := databaseURI(baseURI, dbName)
 
 	ctx := context.Background()
 	wg := &sync.WaitGroup{}
+	cfg.DataSourceName = uri
 
-	_, backend, err := New(ctx, wg, &drivers.Config{DataSourceName: uri})
+	_, backend, err := New(ctx, wg, &cfg)
 	if err != nil {
 		t.Fatalf("creating MongoDB backend: %v", err)
 	}
@@ -63,6 +70,14 @@ func setupBackend(t *testing.T) (context.Context, *sync.WaitGroup, kserver.Backe
 	})
 
 	return ctx, wg, backend
+}
+
+func databaseURI(baseURI, dbName string) string {
+	if strings.Contains(baseURI, "?") {
+		parts := strings.SplitN(baseURI, "?", 2)
+		return strings.TrimRight(parts[0], "/") + "/" + dbName + "?" + parts[1]
+	}
+	return strings.TrimRight(baseURI, "/") + "/" + dbName
 }
 
 // --- helper assertions ---
@@ -462,7 +477,10 @@ func TestMongoDB_Watch(t *testing.T) {
 }
 
 func TestMongoDB_Compact(t *testing.T) {
-	ctx, _, b := setupBackend(t)
+	ctx, _, b := setupBackendWithConfig(t, drivers.Config{
+		CompactMinRetain: 0,
+	})
+	mb := b.(*MongoBackend)
 
 	pfx := func(k string) string { return "/test" + k }
 
@@ -482,11 +500,22 @@ func TestMongoDB_Compact(t *testing.T) {
 	delRev, _, _, err := b.Delete(ctx, pfx("/todelete"), createRev2)
 	noErr(t, err)
 
-	// Compact up to delRev — should remove superseded and tombstone docs.
-	deleted, err := b.Compact(ctx, delRev)
+	beforeCount, err := mb.coll.CountDocuments(ctx, bson.M{})
 	noErr(t, err)
-	if deleted == 0 {
-		t.Fatal("expected Compact to delete at least one document")
+
+	// Compact up to delRev — should remove superseded and tombstone docs.
+	current, err := b.Compact(ctx, delRev)
+	noErr(t, err)
+	expEqual(t, delRev, current)
+
+	compactRev, err := mb.getCompactRevision(ctx)
+	noErr(t, err)
+	expEqual(t, delRev, compactRev)
+
+	afterCount, err := mb.coll.CountDocuments(ctx, bson.M{})
+	noErr(t, err)
+	if afterCount >= beforeCount {
+		t.Fatalf("expected Compact to reduce document count: before=%d after=%d", beforeCount, afterCount)
 	}
 
 	// After compaction, the latest value must still be readable.
@@ -503,6 +532,160 @@ func TestMongoDB_Compact(t *testing.T) {
 	if kv != nil {
 		t.Fatalf("expected deleted key to be absent after compaction, got %+v", kv)
 	}
+
+	_, _, err = b.Get(ctx, pfx("/compact"), "", 0, createRev, false)
+	expEqualErr(t, kserver.ErrCompacted, err)
+}
+
+func TestMongoDB_CompactLargeBacklogAdvancesInBatches(t *testing.T) {
+	ctx, _, b := setupBackendWithConfig(t, drivers.Config{
+		CompactBatchSize: 100,
+		CompactMinRetain: 0,
+	})
+	mb := b.(*MongoBackend)
+
+	key := "/test/backlog"
+	rev, err := b.Create(ctx, key, []byte("v0"), 0)
+	noErr(t, err)
+	for i := range 350 {
+		rev, _, _, err = b.Update(ctx, key, []byte(fmt.Sprintf("v%d", i+1)), rev, 0)
+		noErr(t, err)
+	}
+
+	beforeCount, err := mb.coll.CountDocuments(ctx, bson.M{"key": key})
+	noErr(t, err)
+	expEqual(t, int64(351), beforeCount)
+
+	current, err := b.Compact(ctx, rev)
+	noErr(t, err)
+	expEqual(t, rev, current)
+
+	compactRev, err := mb.getCompactRevision(ctx)
+	noErr(t, err)
+	expEqual(t, rev, compactRev)
+
+	afterCount, err := mb.coll.CountDocuments(ctx, bson.M{"key": key})
+	noErr(t, err)
+	expEqual(t, int64(1), afterCount)
+
+	_, kv, err := b.Get(ctx, key, "", 0, 0, false)
+	noErr(t, err)
+	expEqual(t, "v350", string(kv.Value))
+}
+
+func TestMongoDB_MultipleBackendsConcurrentCreateSameKey(t *testing.T) {
+	ctx, _, b1 := setupBackend(t)
+	mb1 := b1.(*MongoBackend)
+
+	wg := &sync.WaitGroup{}
+	_, b2Raw, err := New(ctx, wg, &drivers.Config{
+		DataSourceName: databaseURI(os.Getenv("MONGODB_TEST_URL"), mb1.db.Name()),
+	})
+	noErr(t, err)
+	noErr(t, b2Raw.Start(ctx))
+	b2 := b2Raw.(*MongoBackend)
+
+	key := "/test/concurrent-create"
+	errs := make(chan error, 2)
+	var writeWG sync.WaitGroup
+	writeWG.Add(2)
+	go func() {
+		defer writeWG.Done()
+		_, err := b1.Create(ctx, key, []byte("from-1"), 0)
+		errs <- err
+	}()
+	go func() {
+		defer writeWG.Done()
+		_, err := b2.Create(ctx, key, []byte("from-2"), 0)
+		errs <- err
+	}()
+	writeWG.Wait()
+	close(errs)
+
+	successes := 0
+	conflicts := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, kserver.ErrKeyExists):
+			conflicts++
+		default:
+			t.Fatalf("unexpected create error: %v", err)
+		}
+	}
+	expEqual(t, 1, successes)
+	expEqual(t, 1, conflicts)
+
+	_, count, err := b1.Count(ctx, "/test/concurrent-create", "", 0)
+	noErr(t, err)
+	expEqual(t, int64(1), count)
+
+	createdDocs, err := mb1.coll.CountDocuments(ctx, bson.M{"key": key, "created": int64(1)})
+	noErr(t, err)
+	expEqual(t, int64(1), createdDocs)
+}
+
+func TestMongoDB_MultipleBackendsConcurrentUpdateSameRevisionNoGap(t *testing.T) {
+	ctx, _, b1 := setupBackend(t)
+	mb1 := b1.(*MongoBackend)
+
+	wg := &sync.WaitGroup{}
+	_, b2Raw, err := New(ctx, wg, &drivers.Config{
+		DataSourceName: databaseURI(os.Getenv("MONGODB_TEST_URL"), mb1.db.Name()),
+	})
+	noErr(t, err)
+	noErr(t, b2Raw.Start(ctx))
+	b2 := b2Raw.(*MongoBackend)
+
+	key := "/test/concurrent-update"
+	createRev, err := b1.Create(ctx, key, []byte("v1"), 0)
+	noErr(t, err)
+
+	type result struct {
+		rev int64
+		ok  bool
+		err error
+	}
+	results := make(chan result, 2)
+	var writeWG sync.WaitGroup
+	writeWG.Add(2)
+	go func() {
+		defer writeWG.Done()
+		rev, _, ok, err := b1.Update(ctx, key, []byte("from-1"), createRev, 0)
+		results <- result{rev: rev, ok: ok, err: err}
+	}()
+	go func() {
+		defer writeWG.Done()
+		rev, _, ok, err := b2.Update(ctx, key, []byte("from-2"), createRev, 0)
+		results <- result{rev: rev, ok: ok, err: err}
+	}()
+	writeWG.Wait()
+	close(results)
+
+	successes := 0
+	conflicts := 0
+	var successRev int64
+	for res := range results {
+		noErr(t, res.err)
+		if res.ok {
+			successes++
+			successRev = res.rev
+		} else {
+			conflicts++
+		}
+	}
+	expEqual(t, 1, successes)
+	expEqual(t, 1, conflicts)
+
+	currentRev, err := b1.CurrentRevision(ctx)
+	noErr(t, err)
+	expEqual(t, createRev+1, currentRev)
+	expEqual(t, createRev+1, successRev)
+
+	docs, err := mb1.coll.CountDocuments(ctx, bson.M{"key": key})
+	noErr(t, err)
+	expEqual(t, int64(2), docs)
 }
 
 func TestMongoDB_DbSize(t *testing.T) {

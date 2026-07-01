@@ -215,26 +215,22 @@ The `-v` flag also removes the MongoDB data volume.
 > workloads, or failure scenarios. Use it at your own risk. Always take a full backup of your source database before
 > proceeding.
 
-kine does not support `etcdctl snapshot` (the etcd binary snapshot format is not implemented). Migration between
-backends is done via the etcd KV API using the tool at [migrate/main.go](migrate/main.go).
+kine does not support `etcdctl snapshot` (the etcd binary snapshot format is not implemented).
 
-The tool reads all keys from the source kine endpoint in paginated batches and writes them to the target. Binary
-values (protobuf-encoded Kubernetes objects) are preserved correctly.
+For PostgreSQL-to-MongoDB migrations, prefer the datastore-level tool at
+[`postgres-to-mongodb/main.go`](postgres-to-mongodb/main.go). It preserves Kine revisions,
+historical rows, tombstones, previous revisions, leases, values, old values, and the compact
+revision marker.
+
+The older API-level tool at [`migrate/main.go`](migrate/main.go) only copies the current
+key/value state through the etcd API. It can be useful for experiments, but it reassigns
+revisions and does not preserve history.
 
 ### Step 1 — Run both kine instances simultaneously
 
-Start the source (PostgreSQL) kine on its default port and the target (MongoDB) kine on a different port:
-
-```bash
-# source — existing PostgreSQL kine (already running, e.g. on :2379)
-
-# target — MongoDB kine on a different port
-kine --endpoint "mongodb://localhost:27017/kine" --listen-address 0.0.0.0:2380
-```
-
-### Step 2 — Stop k3s / k8s writes
-
-Before migrating, stop the API server so no new writes reach the source during the copy:
+For the datastore-level migration, keep the target MongoDB online but do not start k3s/kine
+against it yet. Stop API server writes before taking the final source backup and running the
+copy:
 
 ```bash
 # k3s
@@ -244,22 +240,38 @@ systemctl stop k3s
 k3d cluster stop <cluster-name>
 ```
 
+### Step 2 — Back up PostgreSQL
+
+Always take a source backup first:
+
+```bash
+pg_dump "$POSTGRES_URL" -t kine > kine-before-mongodb-migration.sql
+```
+
 ### Step 3 — Run the migration
 
 ```bash
-go run ./examples/migrate \
-  -source http://localhost:2379 \
-  -target http://localhost:2380
+go run ./examples/postgres-to-mongodb \
+  -postgres "$POSTGRES_URL" \
+  -mongodb "mongodb://localhost:27017/kine?replicaSet=rs0" \
+  -dry-run
+
+go run ./examples/postgres-to-mongodb \
+  -postgres "$POSTGRES_URL" \
+  -mongodb "mongodb://localhost:27017/kine?replicaSet=rs0"
 ```
 
 Example output:
 
 ```
-source: http://localhost:2379
-target: http://localhost:2380
-starting migration...
-  3842 keys migrated
-migration complete: 3842 keys restored
+source rows: 155000
+source non-compact rows: 154999
+source max revision: 4188000
+source compact revision: 4180000
+target MongoDB database: kine
+  154999 rows migrated
+migration complete: inserted 154999 MongoDB Kine documents
+revision document: revision=4188000 compactRevision=4180000
 ```
 
 ### Step 4 — Switch k3s to the MongoDB kine
@@ -273,11 +285,16 @@ k3s server --datastore-endpoint "mongodb://localhost:27017/kine"
 
 ### What is preserved
 
-| Item                      | Preserved                            |
-|---------------------------|--------------------------------------|
-| Current value of each key | Yes                                  |
-| Revision history          | No — revisions are reassigned from 1 |
-| Leases / TTLs             | No                                   |
+| Item                      | API-level `examples/migrate` | PostgreSQL-level `examples/postgres-to-mongodb` |
+|---------------------------|------------------------------|-------------------------------------------------|
+| Current value of each key | Yes                          | Yes                                             |
+| Revision history          | No                           | Yes                                             |
+| Delete tombstones         | No                           | Yes                                             |
+| Previous revisions        | No                           | Yes                                             |
+| Leases / TTLs             | No                           | Yes                                             |
+| Compact revision marker   | No                           | Yes                                             |
 
-Revision history is not needed for normal Kubernetes operation. The API server rebuilds its watch cache from the current
-state on startup.
+PostgreSQL kine does not persist etcd's `Version` field as a dedicated column. The direct
+migration reconstructs it by walking visible rows in revision order. If old rows were already
+compacted before the migration, the reconstructed version is a lower bound; Kubernetes storage
+concurrency uses `ModRevision`, which is preserved exactly.
