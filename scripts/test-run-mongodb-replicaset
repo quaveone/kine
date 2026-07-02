@@ -139,8 +139,21 @@ if (revisions !== "2,3,4,5,6") {
 }
 
 const rev = migration.revision.findOne({_id: "global"});
-if (!rev || n(rev.revision) !== 6 || n(rev.compactRevision) !== 3) {
+if (!rev || n(rev.revision) !== 6) {
   print(`unexpected revision document: ${JSON.stringify(rev)}`);
+  quit(1);
+}
+
+const compact = migration.revision.findOne({_id: "compact"});
+if (!compact || n(compact.compactRevision) !== 3) {
+  print(`unexpected compact document: ${JSON.stringify(compact)}`);
+  quit(1);
+}
+
+const indexes = migration.kine.getIndexes();
+const casIndex = indexes.find((idx) => idx.name === "idx_key_prev_revision_unique");
+if (!casIndex || casIndex.unique !== true) {
+  print(`missing unique CAS index after migration: ${JSON.stringify(indexes.map((idx) => idx.name))}`);
   quit(1);
 }
 

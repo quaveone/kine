@@ -28,7 +28,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
-const revisionDocumentID = "global"
+const (
+	revisionDocumentID = "global"
+	compactDocumentID  = "compact"
+)
 
 func main() {
 	postgresURL := flag.String("postgres", "", "Source PostgreSQL connection URL for the database that contains the kine table")
@@ -122,7 +125,15 @@ func run(ctx context.Context, cfg migrateConfig) error {
 		return fmt.Errorf("inserted %d rows, expected %d", inserted, summary.migratableRows)
 	}
 
-	if err := writeRevisionDocument(ctx, revColl, summary.maxRevision, summary.compactRevision); err != nil {
+	// Build the backend indexes now, while k3s is still offline. This surfaces
+	// any (key, prevRevision) uniqueness violation before cutover and avoids a
+	// slow first k3s/kine start against an unindexed collection.
+	outputln("building MongoDB indexes...")
+	if err := kinemongo.EnsureIndexes(ctx, kineColl); err != nil {
+		return fmt.Errorf("building MongoDB indexes: %w", err)
+	}
+
+	if err := writeRevisionDocuments(ctx, revColl, summary.maxRevision, summary.compactRevision); err != nil {
 		return err
 	}
 
@@ -303,15 +314,28 @@ func (s *versionState) toMongoDocument(row postgresKineRow) kinemongo.KineReg {
 	}
 }
 
-func writeRevisionDocument(ctx context.Context, coll *mongo.Collection, revision, compactRevision int64) error {
+// writeRevisionDocuments seeds the two singleton documents used by the MongoDB
+// backend: the write-hot revision counter and the separate compact marker. They
+// are separate documents so compaction commits never write-conflict with the
+// per-write $inc on the counter.
+func writeRevisionDocuments(ctx context.Context, coll *mongo.Collection, revision, compactRevision int64) error {
 	_, err := coll.UpdateOne(
 		ctx,
 		bson.M{"_id": revisionDocumentID},
-		bson.M{"$set": bson.M{"revision": revision, "compactRevision": compactRevision}},
+		bson.M{"$set": bson.M{"revision": revision}},
 		options.UpdateOne().SetUpsert(true),
 	)
 	if err != nil {
 		return fmt.Errorf("writing MongoDB revision document: %w", err)
+	}
+	_, err = coll.UpdateOne(
+		ctx,
+		bson.M{"_id": compactDocumentID},
+		bson.M{"$set": bson.M{"compactRevision": compactRevision}},
+		options.UpdateOne().SetUpsert(true),
+	)
+	if err != nil {
+		return fmt.Errorf("writing MongoDB compact document: %w", err)
 	}
 	return nil
 }

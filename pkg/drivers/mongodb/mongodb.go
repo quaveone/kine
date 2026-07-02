@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/k3s-io/kine/pkg/drivers"
@@ -27,6 +28,13 @@ const (
 	retryInterval       = 250 * time.Millisecond
 	minCompactBatchSize = 100
 	revisionDocumentID  = "global"
+	// compactDocumentID is a separate singleton so that compaction commits never
+	// touch the write-hot revision counter document. MongoDB write conflicts are
+	// document-level: if the compact marker lived on the counter document, every
+	// compaction batch would conflict with concurrent $inc writes and could be
+	// aborted/retried indefinitely under sustained Kubernetes write churn —
+	// exactly the compaction-starvation failure mode this backend must prevent.
+	compactDocumentID = "compact"
 )
 
 func init() {
@@ -54,9 +62,12 @@ type KineReg struct {
 	Version        int64         `bson:"version"`
 }
 
-// RevisionReg is the single document in the revision collection used as an atomic counter.
-// It also stores the last compacted revision so that Get/Watch can return ErrCompacted
-// for historical reads below the compact point.
+// RevisionReg models the singleton documents in the revision collection.
+// The document with _id "global" is the atomic revision counter; the document
+// with _id "compact" stores the last compacted revision so that Get/Watch can
+// return ErrCompacted for historical reads below the compact point. They are
+// separate documents so compaction commits never write-conflict with the
+// per-write $inc on the counter.
 type RevisionReg struct {
 	Revision        int64 `bson:"revision"`
 	CompactRevision int64 `bson:"compactRevision,omitempty"`
@@ -104,6 +115,10 @@ type MongoBackend struct {
 	// waking all goroutines waiting on the old channel.
 	watchMu sync.RWMutex
 	watchCh chan struct{}
+	// compactRevCache holds the last compact revision observed from the datastore.
+	// It exists only so the write hot path can refresh the compaction-gap metric
+	// without extra reads; correctness paths always read the compact document.
+	compactRevCache atomic.Int64
 }
 
 // New creates a MongoBackend and registers it under the "mongodb" scheme.
@@ -178,7 +193,7 @@ func (b *MongoBackend) Start(ctx context.Context) error {
 	if err := b.ensureRevisionDocument(ctx); err != nil {
 		return fmt.Errorf("ensuring MongoDB revision document: %w", err)
 	}
-	if err := setupIndexes(ctx, b.coll); err != nil {
+	if err := EnsureIndexes(ctx, b.coll); err != nil {
 		return fmt.Errorf("setting up MongoDB indexes: %w", err)
 	}
 	// Create the health key and immediately update it to advance to revision 2.
@@ -229,43 +244,63 @@ func (b *MongoBackend) validateTransactionSupport(ctx context.Context) error {
 	return nil
 }
 
-// ensureRevisionDocument creates the singleton global revision counter document.
-// The counter starts at 0 so the health Create and Update performed by Start
-// leave a fresh backend at revision 2, matching the SQL backends.
+// ensureRevisionDocument creates the singleton revision counter and compact
+// marker documents. The counter starts at 0 so the health Create and Update
+// performed by Start leave a fresh backend at revision 2, matching the SQL
+// backends. Older layouts (compactRevision stored on the counter document, or
+// a counter document with a random _id) are used to seed the new documents.
 func (b *MongoBackend) ensureRevisionDocument(ctx context.Context) error {
-	err := b.collRevision.FindOne(ctx, bson.M{"_id": revisionDocumentID}).Err()
-	if err == nil {
+	revErr := b.collRevision.FindOne(ctx, bson.M{"_id": revisionDocumentID}).Err()
+	if revErr != nil && !errors.Is(revErr, mongo.ErrNoDocuments) {
+		return revErr
+	}
+	compactErr := b.collRevision.FindOne(ctx, bson.M{"_id": compactDocumentID}).Err()
+	if compactErr != nil && !errors.Is(compactErr, mongo.ErrNoDocuments) {
+		return compactErr
+	}
+	if revErr == nil && compactErr == nil {
 		return nil
 	}
-	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
-		return err
-	}
 
+	revision := int64(0)
+	compactRevision := int64(0)
 	var legacy RevisionReg
-	legacyErr := b.collRevision.FindOne(ctx, bson.M{}).Decode(&legacy)
+	legacyErr := b.collRevision.FindOne(
+		ctx,
+		bson.M{"_id": bson.M{"$ne": compactDocumentID}},
+		options.FindOne().SetSort(bson.D{{Key: "revision", Value: -1}}),
+	).Decode(&legacy)
 	if legacyErr != nil && !errors.Is(legacyErr, mongo.ErrNoDocuments) {
 		return legacyErr
 	}
-	revision := int64(0)
-	compactRevision := int64(0)
 	if legacyErr == nil {
 		revision = legacy.Revision
 		compactRevision = legacy.CompactRevision
 	}
 
-	_, err = b.collRevision.UpdateOne(
-		ctx,
-		bson.M{"_id": revisionDocumentID},
-		bson.M{"$setOnInsert": bson.M{
-			"revision":        revision,
-			"compactRevision": compactRevision,
-		}},
-		options.UpdateOne().SetUpsert(true),
-	)
-	if mongo.IsDuplicateKeyError(err) {
-		return nil
+	if revErr != nil {
+		_, err := b.collRevision.UpdateOne(
+			ctx,
+			bson.M{"_id": revisionDocumentID},
+			bson.M{"$setOnInsert": bson.M{"revision": revision}},
+			options.UpdateOne().SetUpsert(true),
+		)
+		if err != nil && !mongo.IsDuplicateKeyError(err) {
+			return err
+		}
 	}
-	return err
+	if compactErr != nil {
+		_, err := b.collRevision.UpdateOne(
+			ctx,
+			bson.M{"_id": compactDocumentID},
+			bson.M{"$setOnInsert": bson.M{"compactRevision": compactRevision}},
+			options.UpdateOne().SetUpsert(true),
+		)
+		if err != nil && !mongo.IsDuplicateKeyError(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *MongoBackend) startCompactor(ctx context.Context) error {
@@ -317,22 +352,25 @@ func (b *MongoBackend) nextRevision(ctx context.Context) (int64, error) {
 // getCompactRevision returns the last revision that has been compacted, or 0 if none.
 func (b *MongoBackend) getCompactRevision(ctx context.Context) (int64, error) {
 	var rev RevisionReg
-	err := b.collRevision.FindOne(ctx, bson.M{"_id": revisionDocumentID}).Decode(&rev)
+	err := b.collRevision.FindOne(ctx, bson.M{"_id": compactDocumentID}).Decode(&rev)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
+	b.compactRevCache.Store(rev.CompactRevision)
 	return rev.CompactRevision, nil
 }
 
 // setCompactRevision persists the compact revision so future Get/Watch calls can
-// return ErrCompacted for historical reads at or below this point.
+// return ErrCompacted for historical reads at or below this point. It writes the
+// dedicated compact document, never the revision counter document, so compaction
+// transactions cannot write-conflict with concurrent writes.
 func (b *MongoBackend) setCompactRevision(ctx context.Context, revision int64) error {
 	_, err := b.collRevision.UpdateOne(
 		ctx,
-		bson.M{"_id": revisionDocumentID},
+		bson.M{"_id": compactDocumentID},
 		bson.M{"$set": bson.M{"compactRevision": revision}},
 		options.UpdateOne().SetUpsert(true),
 	)
@@ -390,6 +428,15 @@ func (b *MongoBackend) observeRevisionMetrics(ctx context.Context) {
 	metrics.MongoDBCompactionGap.Set(float64(currentRev - compactRev))
 }
 
+// setRevisionMetrics refreshes the revision gauges from a revision that has just
+// been committed by this process, so the write hot path does not need extra
+// datastore reads. The compact revision comes from the local cache; the
+// authoritative refresh happens on every compaction iteration.
+func (b *MongoBackend) setRevisionMetrics(rev int64) {
+	metrics.MongoDBCurrentRevision.Set(float64(rev))
+	metrics.MongoDBCompactionGap.Set(float64(rev - b.compactRevCache.Load()))
+}
+
 func (b *MongoBackend) observeCollectionMetrics(ctx context.Context) {
 	count, err := b.coll.EstimatedDocumentCount(ctx)
 	if err != nil {
@@ -430,22 +477,22 @@ func (b *MongoBackend) Get(ctx context.Context, key, rangeEnd string, limit, rev
 
 	var doc KineReg
 	err := b.coll.FindOne(ctx, filter, opts).Decode(&doc)
-	curRev, curRevErr := b.CurrentRevision(ctx)
-	if errors.Is(err, mongo.ErrNoDocuments) || doc.Deleted != 0 {
-		if curRevErr != nil {
-			return 0, nil, curRevErr
-		}
-		return curRev, nil, nil
+	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+		return 0, nil, err
 	}
+	notFound := errors.Is(err, mongo.ErrNoDocuments) || doc.Deleted != 0
+
+	// Reads at an explicit revision answer at that revision; only latest reads
+	// and misses need the current revision.
+	if revision > 0 && !notFound {
+		return revision, doc.toKeyValue(keysOnly), nil
+	}
+	curRev, err := b.CurrentRevision(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
-
-	if revision > 0 {
-		return revision, doc.toKeyValue(keysOnly), nil
-	}
-	if curRevErr != nil {
-		return 0, nil, curRevErr
+	if notFound {
+		return curRev, nil, nil
 	}
 	return curRev, doc.toKeyValue(keysOnly), nil
 }
@@ -491,12 +538,12 @@ func (b *MongoBackend) Create(ctx context.Context, key string, value []byte, lea
 		}
 		return 0, err
 	}
-	b.notifyWatchers()
-	b.observeRevisionMetrics(ctx)
 	rev, ok := result.(int64)
 	if !ok {
 		return 0, fmt.Errorf("unexpected MongoDB create transaction result type %T", result)
 	}
+	b.notifyWatchers()
+	b.setRevisionMetrics(rev)
 	return rev, nil
 }
 
@@ -558,7 +605,7 @@ func (b *MongoBackend) Update(ctx context.Context, key string, value []byte, rev
 	}
 	if out.ok {
 		b.notifyWatchers()
-		b.observeRevisionMetrics(ctx)
+		b.setRevisionMetrics(out.rev)
 	}
 	return out.rev, out.kv, out.ok, nil
 }
@@ -617,7 +664,7 @@ func (b *MongoBackend) Delete(ctx context.Context, key string, revision int64) (
 	}
 	if out.ok && out.kv != nil {
 		b.notifyWatchers()
-		b.observeRevisionMetrics(ctx)
+		b.setRevisionMetrics(out.rev)
 	}
 	return out.rev, out.kv, out.ok, nil
 }
@@ -715,7 +762,9 @@ func (b *MongoBackend) Count(ctx context.Context, prefix, startKey string, revis
 
 	pipeline := mongo.Pipeline{
 		{{Key: "$match", Value: matchFilter}},
-		{{Key: "$sort", Value: bson.D{{Key: "revision", Value: -1}}}},
+		// Sort must match idx_key_revision_desc so the aggregation streams from
+		// the index instead of doing a blocking in-memory sort of the whole range.
+		{{Key: "$sort", Value: bson.D{{Key: "key", Value: 1}, {Key: "revision", Value: -1}}}},
 		{{Key: "$group", Value: bson.M{
 			"_id":     "$key",
 			"deleted": bson.M{"$first": "$deleted"},
@@ -748,11 +797,24 @@ func (b *MongoBackend) Count(ctx context.Context, prefix, startKey string, revis
 
 // Watch returns a WatchResult that emits Events for keys matching the key prefix
 // with revision greater than the given revision.
-// Uses a polling approach: a goroutine waits for a broadcast signal from appendEvent,
+// Uses a polling approach: a goroutine waits for a broadcast from notifyWatchers,
 // then queries for new documents since the last known revision.
 func (b *MongoBackend) Watch(ctx context.Context, key string, revision int64) server.WatchResult {
-	curRev, _ := b.CurrentRevision(ctx)
-	compactRev, _ := b.getCompactRevision(ctx)
+	curRev, err := b.CurrentRevision(ctx)
+	var compactRev int64
+	if err == nil {
+		compactRev, err = b.getCompactRevision(ctx)
+	}
+	if err != nil {
+		// Fail the watch instead of starting from revision 0, which would replay
+		// the entire event log to the caller. The server cancels the watch with
+		// this error and the client re-establishes it.
+		eventC := make(chan []*server.Event)
+		close(eventC)
+		errC := make(chan error, 1)
+		errC <- err
+		return server.WatchResult{Events: eventC, Errorc: errC}
+	}
 
 	// If the requested start revision has been compacted, signal the caller immediately.
 	// Watch uses <= because the event log AT compactRev is gone; List/Get use < because
@@ -997,6 +1059,7 @@ func (b *MongoBackend) compactBatch(ctx context.Context, compactRev, targetCompa
 	if !ok {
 		return 0, 0, fmt.Errorf("unexpected MongoDB compact transaction result type %T", result)
 	}
+	b.compactRevCache.Store(out.compacted)
 	if out.deleted > 0 {
 		metrics.MongoDBCompactionDeletedDocumentsTotal.Add(float64(out.deleted))
 	}
@@ -1087,17 +1150,9 @@ func (b *MongoBackend) WaitForSyncTo(revision int64) {
 	}
 }
 
-// appendEvent inserts a new event document and broadcasts to all active Watch goroutines.
-func (b *MongoBackend) appendEvent(ctx context.Context, event *server.Event) (int64, error) {
-	rev, err := b.insertEvent(ctx, event)
-	if err != nil {
-		return 0, err
-	}
-	b.notifyWatchers()
-	b.observeRevisionMetrics(ctx)
-	return rev, nil
-}
-
+// insertEvent allocates the next revision and inserts the event document.
+// It must only be called inside a MongoDB transaction (withTransaction):
+// outside one, a failed insert would leave a committed revision gap.
 func (b *MongoBackend) insertEvent(ctx context.Context, event *server.Event) (int64, error) {
 	if event.KV == nil {
 		event.KV = &server.KeyValue{}
@@ -1365,44 +1420,40 @@ func (b *MongoBackend) upsertTTLEntry(mu *sync.RWMutex, store map[string]*ttlEve
 	queue.AddAfter(kv.Key, expires)
 }
 
-// setupIndexes creates the required indexes on the kine collection.
-func setupIndexes(ctx context.Context, coll *mongo.Collection) error {
+// EnsureIndexes creates the required indexes on the kine collection. Every index
+// here is used by a specific query path; do not add indexes speculatively, since
+// each one is maintained on every Kubernetes write.
+//
+// It is exported so the offline PostgreSQL migration tool can build the indexes
+// (including the unique CAS index) right after the bulk copy, before k3s first
+// points at the migrated datastore.
+func EnsureIndexes(ctx context.Context, coll *mongo.Collection) error {
 	models := []mongo.IndexModel{
 		{
-			Keys:    bson.D{{Key: "key", Value: 1}},
-			Options: options.Index().SetName("idx_key"),
-		},
-		{
+			// Get/List/Count/findLatestForKey: latest revision per key.
 			Keys:    bson.D{{Key: "key", Value: 1}, {Key: "revision", Value: -1}},
 			Options: options.Index().SetName("idx_key_revision_desc"),
 		},
 		{
+			// Cross-Kine-replica CAS guard: at most one successful successor
+			// per (key, previous revision).
 			Keys:    bson.D{{Key: "key", Value: 1}, {Key: "prevRevision", Value: 1}},
 			Options: options.Index().SetName("idx_key_prev_revision_unique").SetUnique(true),
 		},
 		{
-			Keys:    bson.D{{Key: "key", Value: 1}, {Key: "_id", Value: 1}},
-			Options: options.Index().SetName("idx_key_id"),
+			// Global ordering, watch catch-up scans, and compaction deletes by revision.
+			Keys:    bson.D{{Key: "revision", Value: 1}},
+			Options: options.Index().SetName("idx_revision_unique").SetUnique(true),
 		},
 		{
-			Keys:    bson.D{{Key: "_id", Value: 1}, {Key: "deleted", Value: 1}},
-			Options: options.Index().SetName("idx_id_deleted"),
-		},
-		{
-			Keys:    bson.D{{Key: "prevRevision", Value: 1}},
-			Options: options.Index().SetName("idx_prev_revision"),
-		},
-		{
+			// Compaction window aggregation (revision range + prevRevision > 0).
 			Keys:    bson.D{{Key: "revision", Value: 1}, {Key: "prevRevision", Value: 1}},
 			Options: options.Index().SetName("idx_revision_prev_revision"),
 		},
 		{
+			// Compaction tombstone deletes (revision range + deleted > 0).
 			Keys:    bson.D{{Key: "revision", Value: 1}, {Key: "deleted", Value: 1}},
 			Options: options.Index().SetName("idx_revision_deleted"),
-		},
-		{
-			Keys:    bson.D{{Key: "revision", Value: 1}},
-			Options: options.Index().SetName("idx_revision_unique").SetUnique(true),
 		},
 	}
 	_, err := coll.Indexes().CreateMany(ctx, models)
