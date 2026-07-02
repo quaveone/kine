@@ -8,11 +8,15 @@ a separate `revision` collection as an atomic counter for global ordering.
 
 Key characteristics of this backend:
 
+- Revision allocation and event insert are coupled in a multi-document transaction, so a failed write cannot leave a committed revision gap
 - Atomic revision counter using MongoDB `$inc` operations
+- Unique `(key, prevRevision)` index as the cross-instance compare-and-swap guard
 - Polling-based watch mechanism (no Change Streams required)
 - TTL support for leased keys
 - Multiple kine instances can safely share the same MongoDB deployment (leader election enabled)
-- Requires MongoDB >= 4.4
+- **Requires a MongoDB replica set or sharded cluster.** The backend depends on
+  multi-document transactions and refuses to start against a standalone `mongod`.
+  A single-node replica set (`rs.initiate()`) is enough for local development.
 
 ## Configuring KINE
 
@@ -41,22 +45,25 @@ query parameters (e.g. `authSource`, `replicaSet`, `tls`).
 
 ### Examples
 
-Connect to a local MongoDB instance using the default database `kine`:
+All examples assume the target is a replica set (a single-node replica set works for
+local development; standalone servers are rejected at startup).
+
+Connect to a local single-node replica set using the default database `kine`:
 
 ```
-mongodb://localhost:27017
+mongodb://localhost:27017/?replicaSet=rs0
 ```
 
 Connect specifying a custom database name:
 
 ```
-mongodb://localhost:27017/mydb
+mongodb://localhost:27017/mydb?replicaSet=rs0
 ```
 
 Connect with authentication:
 
 ```
-mongodb://admin:secret@localhost:27017/kine
+mongodb://admin:secret@localhost:27017/kine?replicaSet=rs0
 ```
 
 Connect to a MongoDB Atlas cluster using the DNS seed list format:
@@ -65,7 +72,7 @@ Connect to a MongoDB Atlas cluster using the DNS seed list format:
 mongodb+srv://user:password@cluster0.example.mongodb.net/kine
 ```
 
-Connect to a replica set:
+Connect to a three-member replica set:
 
 ```
 mongodb://mongo1:27017,mongo2:27017,mongo3:27017/kine?replicaSet=rs0
@@ -73,22 +80,22 @@ mongodb://mongo1:27017,mongo2:27017,mongo3:27017/kine?replicaSet=rs0
 
 ## Running kine standalone
 
-Start kine pointing to a local MongoDB instance:
+Start kine pointing to a local single-node replica set:
 
 ```bash
-kine --endpoint "mongodb://localhost:27017/kine"
+kine --endpoint "mongodb://localhost:27017/kine?replicaSet=rs0"
 ```
 
 With authentication:
 
 ```bash
-kine --endpoint "mongodb://admin:secret@localhost:27017/kine"
+kine --endpoint "mongodb://admin:secret@localhost:27017/kine?replicaSet=rs0"
 ```
 
 With TLS:
 
 ```bash
-kine --endpoint "mongodb://localhost:27017/kine" \
+kine --endpoint "mongodb://localhost:27017/kine?replicaSet=rs0" \
   --ca-file ca.crt \
   --cert-file client.crt \
   --key-file client.key
@@ -97,14 +104,14 @@ kine --endpoint "mongodb://localhost:27017/kine" \
 ## Using with k3s
 
 ```bash
-k3s server --datastore-endpoint "mongodb://localhost:27017/kine"
+k3s server --datastore-endpoint "mongodb://mongo1:27017,mongo2:27017,mongo3:27017/kine?replicaSet=rs0"
 ```
 
 With TLS:
 
 ```bash
 k3s server \
-  --datastore-endpoint "mongodb://localhost:27017/kine" \
+  --datastore-endpoint "mongodb://mongo1:27017,mongo2:27017,mongo3:27017/kine?replicaSet=rs0" \
   --datastore-cafile ca.crt \
   --datastore-certfile client.crt \
   --datastore-keyfile client.key
@@ -132,23 +139,25 @@ Each document represents one revision event for a key.
 
 ### Collection: `revision`
 
-A single document used as the global atomic revision counter.
+Two singleton documents. They are separate documents on purpose: MongoDB write
+conflicts are document-level, so keeping the compact marker off the write-hot
+counter document prevents compaction transactions from conflicting with every
+concurrent write.
 
-| Field             | Type     | Description                                                 |
-|-------------------|----------|-------------------------------------------------------------|
-| `_id`             | ObjectID | Document ID                                                 |
-| `revision`        | int64    | Current global revision (incremented atomically via `$inc`) |
-| `compactRevision` | int64    | Last compacted revision                                     |
+| `_id`      | Field             | Description                                                 |
+|------------|-------------------|-------------------------------------------------------------|
+| `global`   | `revision`        | Current global revision (incremented atomically via `$inc`) |
+| `compact`  | `compactRevision` | Last compacted revision                                     |
 
 ### Indexes on `kine`
 
-| Index               | Fields           | Notes                    |
-|---------------------|------------------|--------------------------|
-| `idx_revision`      | `revision`       | Unique — global ordering |
-| `idx_key`           | `key`            | Key lookups              |
-| `idx_key_id`        | `key`, `_id`     | Range queries            |
-| `idx_id_deleted`    | `_id`, `deleted` | Soft-delete filtering    |
-| `idx_prev_revision` | `prevRevision`   | Watch / After queries    |
+| Index                          | Fields                    | Notes                                                       |
+|--------------------------------|---------------------------|-------------------------------------------------------------|
+| `idx_key_revision_desc`        | `key`, `revision` desc    | Latest revision per key (Get/List/Count)                    |
+| `idx_key_prev_revision_unique` | `key`, `prevRevision`     | Unique — cross-instance compare-and-swap guard              |
+| `idx_revision_unique`          | `revision`                | Unique — global ordering, watch catch-up, compaction delete |
+| `idx_revision_prev_revision`   | `revision`, `prevRevision`| Compaction window aggregation                               |
+| `idx_revision_deleted`         | `revision`, `deleted`     | Compaction tombstone deletes                                |
 
 ## Local development with Docker Compose and k3d
 
@@ -215,26 +224,22 @@ The `-v` flag also removes the MongoDB data volume.
 > workloads, or failure scenarios. Use it at your own risk. Always take a full backup of your source database before
 > proceeding.
 
-kine does not support `etcdctl snapshot` (the etcd binary snapshot format is not implemented). Migration between
-backends is done via the etcd KV API using the tool at [migrate/main.go](migrate/main.go).
+kine does not support `etcdctl snapshot` (the etcd binary snapshot format is not implemented).
 
-The tool reads all keys from the source kine endpoint in paginated batches and writes them to the target. Binary
-values (protobuf-encoded Kubernetes objects) are preserved correctly.
+For PostgreSQL-to-MongoDB migrations, prefer the datastore-level tool at
+[`postgres-to-mongodb/main.go`](postgres-to-mongodb/main.go). It preserves Kine revisions,
+historical rows, tombstones, previous revisions, leases, values, old values, and the compact
+revision marker.
+
+The older API-level tool at [`migrate/main.go`](migrate/main.go) only copies the current
+key/value state through the etcd API. It can be useful for experiments, but it reassigns
+revisions and does not preserve history.
 
 ### Step 1 — Run both kine instances simultaneously
 
-Start the source (PostgreSQL) kine on its default port and the target (MongoDB) kine on a different port:
-
-```bash
-# source — existing PostgreSQL kine (already running, e.g. on :2379)
-
-# target — MongoDB kine on a different port
-kine --endpoint "mongodb://localhost:27017/kine" --listen-address 0.0.0.0:2380
-```
-
-### Step 2 — Stop k3s / k8s writes
-
-Before migrating, stop the API server so no new writes reach the source during the copy:
+For the datastore-level migration, keep the target MongoDB online but do not start k3s/kine
+against it yet. Stop API server writes before taking the final source backup and running the
+copy:
 
 ```bash
 # k3s
@@ -244,23 +249,44 @@ systemctl stop k3s
 k3d cluster stop <cluster-name>
 ```
 
+### Step 2 — Back up PostgreSQL
+
+Always take a source backup first:
+
+```bash
+pg_dump "$POSTGRES_URL" -t kine > kine-before-mongodb-migration.sql
+```
+
 ### Step 3 — Run the migration
 
 ```bash
-go run ./examples/migrate \
-  -source http://localhost:2379 \
-  -target http://localhost:2380
+go run ./examples/postgres-to-mongodb \
+  -postgres "$POSTGRES_URL" \
+  -mongodb "mongodb://localhost:27017/kine?replicaSet=rs0" \
+  -dry-run
+
+go run ./examples/postgres-to-mongodb \
+  -postgres "$POSTGRES_URL" \
+  -mongodb "mongodb://localhost:27017/kine?replicaSet=rs0"
 ```
 
 Example output:
 
 ```
-source: http://localhost:2379
-target: http://localhost:2380
-starting migration...
-  3842 keys migrated
-migration complete: 3842 keys restored
+source rows: 155000
+source non-compact rows: 154999
+source max revision: 4188000
+source compact revision: 4180000
+target MongoDB database: kine
+  154999 rows migrated
+building MongoDB indexes...
+migration complete: inserted 154999 MongoDB Kine documents
+revision document: revision=4188000 compactRevision=4180000
 ```
+
+The migration also builds all backend indexes (including the unique
+`(key, prevRevision)` compare-and-swap index) before declaring success, so any
+data problem surfaces before cutover instead of during the first k3s start.
 
 ### Step 4 — Switch k3s to the MongoDB kine
 
@@ -268,16 +294,21 @@ Update the k3s datastore endpoint to point to the new kine instance and restart:
 
 ```bash
 # Edit /etc/systemd/system/k3s.service or pass the flag directly
-k3s server --datastore-endpoint "mongodb://localhost:27017/kine"
+k3s server --datastore-endpoint "mongodb://mongo1:27017,mongo2:27017,mongo3:27017/kine?replicaSet=rs0"
 ```
 
 ### What is preserved
 
-| Item                      | Preserved                            |
-|---------------------------|--------------------------------------|
-| Current value of each key | Yes                                  |
-| Revision history          | No — revisions are reassigned from 1 |
-| Leases / TTLs             | No                                   |
+| Item                      | API-level `examples/migrate` | PostgreSQL-level `examples/postgres-to-mongodb` |
+|---------------------------|------------------------------|-------------------------------------------------|
+| Current value of each key | Yes                          | Yes                                             |
+| Revision history          | No                           | Yes                                             |
+| Delete tombstones         | No                           | Yes                                             |
+| Previous revisions        | No                           | Yes                                             |
+| Leases / TTLs             | No                           | Yes                                             |
+| Compact revision marker   | No                           | Yes                                             |
 
-Revision history is not needed for normal Kubernetes operation. The API server rebuilds its watch cache from the current
-state on startup.
+PostgreSQL kine does not persist etcd's `Version` field as a dedicated column. The direct
+migration reconstructs it by walking visible rows in revision order. If old rows were already
+compacted before the migration, the reconstructed version is a lower bound; Kubernetes storage
+concurrency uses `ModRevision`, which is preserved exactly.

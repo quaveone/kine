@@ -109,6 +109,12 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 			metrics.SQLTime,
 			metrics.CompactTotal,
 			metrics.InsertErrorsTotal,
+			metrics.MongoDBCurrentRevision,
+			metrics.MongoDBCompactRevision,
+			metrics.MongoDBCompactionGap,
+			metrics.MongoDBDocuments,
+			metrics.MongoDBCompactionDeletedDocumentsTotal,
+			metrics.MongoDBCompactionBatchSeconds,
 		)
 	}
 

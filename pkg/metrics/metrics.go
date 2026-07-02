@@ -35,6 +35,37 @@ var (
 		Name: "kine_insert_errors_total",
 		Help: "Total number of insert retries due to unique constraint violations",
 	}, []string{"retriable"})
+
+	MongoDBCurrentRevision = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "kine_mongodb_current_revision",
+		Help: "Current global revision stored by the MongoDB backend",
+	})
+
+	MongoDBCompactRevision = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "kine_mongodb_compact_revision",
+		Help: "Last compacted revision stored by the MongoDB backend",
+	})
+
+	MongoDBCompactionGap = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "kine_mongodb_compaction_gap",
+		Help: "Difference between current revision and compact revision in the MongoDB backend",
+	})
+
+	MongoDBDocuments = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "kine_mongodb_documents",
+		Help: "Estimated number of documents in the MongoDB kine collection",
+	})
+
+	MongoDBCompactionDeletedDocumentsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kine_mongodb_compaction_deleted_documents_total",
+		Help: "Total number of documents deleted by MongoDB backend compaction",
+	})
+
+	MongoDBCompactionBatchSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "kine_mongodb_compaction_batch_seconds",
+		Help:    "Length of time per MongoDB backend compaction batch",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+	})
 )
 
 var (

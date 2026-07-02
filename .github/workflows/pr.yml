@@ -86,9 +86,21 @@ jobs:
         if-no-files-found: error
         retention-days: 1
 
+  mongodb:
+    name: MongoDB Replica Set
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Run MongoDB replica-set tests
+      run: ./scripts/test-run-mongodb-replicaset
+
   docker:
     name: Docker
-    needs: build
+    needs: [build, mongodb]
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -110,4 +122,4 @@ jobs:
 
     - name: Run Test
       run: |
-        docker run --name run-test-${{ matrix.test }} --rm -v /var/run/docker.sock:/var/run/docker.sock -e TAG=latest rancher/kine-test:latest scripts/test ${{ matrix.test }}
+        docker run --name run-test-${{ matrix.test }} --rm -v /var/run/docker.sock:/var/run/docker.sock -e TAG=latest -e KINE_SKIP_SLOW_NAMESPACE_DRAINING=${{ matrix.arch == 'arm64' && matrix.test == 'sqlite' }} rancher/kine-test:latest scripts/test ${{ matrix.test }}
